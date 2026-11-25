@@ -7,7 +7,7 @@
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { mockPrisma, queueAdd, readComments } = vi.hoisted(() => ({
+const { mockPrisma, queueAdd, readComments, readMedia } = vi.hoisted(() => ({
   mockPrisma: {
     $queryRaw: vi.fn(),
     automation: { findMany: vi.fn() },
@@ -16,6 +16,7 @@ const { mockPrisma, queueAdd, readComments } = vi.hoisted(() => ({
   },
   queueAdd: vi.fn(),
   readComments: vi.fn(),
+  readMedia: vi.fn(),
 }));
 vi.mock("@/lib/queue/client", () => ({
   getDMQueue: () => ({ add: queueAdd }),
@@ -27,6 +28,7 @@ vi.mock("@/lib/instagram/provider", async (importOriginal) => ({
     accessToken: "local-test",
   }),
   getRecentMediaComments: readComments,
+  getUserMedia: readMedia,
 }));
 
 vi.mock("@/lib/db/client", () => ({ prisma: mockPrisma }));
@@ -135,4 +137,29 @@ describe("comment polling does not recreate unsafe sends", () => {
         expect(data.commentId).toBe("new");
     },
   );
+});
+
+describe("one sweep shares Instagram reads across campaigns on the same account", () => {
+  it("lists media once per account and reads each post's comments once", async () => {
+    queueAdd.mockReset();
+    readComments.mockReset();
+    readMedia.mockReset();
+    mockPrisma.operationalEvent.create.mockResolvedValue({});
+    mockPrisma.dmLog.findMany.mockResolvedValue([]);
+    const account = { id: "connection", instagramId: "owner", provider: "META", accessToken: "test" };
+    const campaign = (id: string, word: string) => ({
+      id, name: id, workspaceId: "workspace", postId: null, matchAnyPost: true,
+      matchAnyWord: false, keywords: [word], wholeWordMatch: true, publicReplyEnabled: false,
+      instagramAccount: account,
+    });
+    mockPrisma.automation.findMany.mockResolvedValue([campaign("a", "BOT"), campaign("b", "LEAK"), campaign("c", "SEEN")]);
+    readMedia.mockResolvedValue([{ id: "m1" }, { id: "m2" }]);
+    readComments.mockImplementation(async ({ mediaId }: { mediaId: string }) => [
+      { id: `${mediaId}-c`, text: mediaId === "m1" ? "BOT" : "LEAK", from: { id: "reader" }, timestamp: new Date().toISOString() },
+    ]);
+    await reconcileComments();
+    expect(readMedia).toHaveBeenCalledTimes(1);
+    expect(readComments).toHaveBeenCalledTimes(2);
+    expect(queueAdd.mock.calls.map(([, d]) => d.commentId).sort()).toEqual(["m1-c", "m2-c"]);
+  });
 });

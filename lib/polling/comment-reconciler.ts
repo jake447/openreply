@@ -97,12 +97,18 @@ export async function reconcileComments(): Promise<void> {
 
   const sinceMs = Date.now() - LOOKBACK_HOURS * 60 * 60 * 1000;
   const tokenCache = new Map<string, InstagramContext | null>();
+  // One media list per account and one comment fetch per post per sweep, shared by
+  // every campaign on that account, so the call count doesn't grow with campaigns.
+  const mediaCache = new Map<string, Promise<string[]>>();
+  const commentCache = new Map<string, Promise<InstagramComment[]>>();
 
   for (const automation of automations) {
     const stat = await sweepCampaign({
       automation: automation,
       sinceMs: sinceMs,
       tokenCache: tokenCache,
+      mediaCache: mediaCache,
+      commentCache: commentCache,
     }).catch(
       (error): SweepStat => ({
         campaign: automation.name,
@@ -121,6 +127,8 @@ async function sweepCampaign({
   automation,
   sinceMs,
   tokenCache,
+  mediaCache,
+  commentCache,
 }: {
   automation: {
     id: string;
@@ -144,6 +152,8 @@ async function sweepCampaign({
   };
   sinceMs: number;
   tokenCache: Map<string, InstagramContext | null>;
+  mediaCache: Map<string, Promise<string[]>>;
+  commentCache: Map<string, Promise<InstagramComment[]>>;
 }): Promise<SweepStat> {
   const account = automation.instagramAccount;
   const stat: SweepStat = {
@@ -180,11 +190,12 @@ async function sweepCampaign({
     mediaIds.push(...(await adMediaFor(automation.postId)));
   } else if (automation.matchAnyPost) {
     try {
-      const media = await getUserMedia({
-        context: accessToken,
-        limit: RECENT_MEDIA_LIMIT,
-      });
-      mediaIds.push(...media.map((m) => m.id));
+      let media = mediaCache.get(account.id);
+      if (!media) {
+        media = getUserMedia({ context: accessToken, limit: RECENT_MEDIA_LIMIT }).then((list) => list.map((m) => m.id));
+        mediaCache.set(account.id, media);
+      }
+      mediaIds.push(...(await media));
     } catch (error) {
       stat.errors.push(`Media list: ${errMessage(error)}`);
     }
@@ -196,11 +207,12 @@ async function sweepCampaign({
   for (const mediaId of mediaIds) {
     let comments: InstagramComment[];
     try {
-      comments = await getRecentMediaComments({
-        context: accessToken,
-        mediaId: mediaId,
-        sinceMs: sinceMs,
-      });
+      let pending = commentCache.get(mediaId);
+      if (!pending) {
+        pending = getRecentMediaComments({ context: accessToken, mediaId: mediaId, sinceMs: sinceMs });
+        commentCache.set(mediaId, pending);
+      }
+      comments = await pending;
     } catch (error) {
       stat.errors.push(`Comments ${mediaId}: ${errMessage(error)}`);
       continue;
